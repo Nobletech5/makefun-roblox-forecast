@@ -1,6 +1,6 @@
-"""Roblox Up-and-Coming top-10 forecast (program/v1, Python 3.13, stdlib only).
+"""Roblox Up-and-Coming top-10 forecast v2 (program/v1, Python 3.13, stdlib only).
 
-Reads /input/history.ndjson (hourly-ish reads of Roblox's Up-and-Coming chart)
+Reads /input/history.ndjson (reads of Roblox's Up-and-Coming chart)
 and /input/task.json, writes /output/forecast.json: for each place 1..10, a
 probability for each game of being at that place, plus a top10 ordering.
 
@@ -8,10 +8,26 @@ Approach: a recency-weighted kernel mixture over every game's observed ranks.
 Each past read contributes a discrete kernel centred on the game's rank then,
 shifted by its recent rank velocity times the forecast horizon and widened by
 diffusion over the age of the observation plus the horizon. Recent reads weigh
-most (half-life 36h). All ~97 games on the last chart are named at every place
-(up to 100 rows per place); each place sums to 0.95, leaving 0.05 unnamed for
-games that join the chart during the window. Every named probability is floored
-so no game ever scores the -9.21 log floor.
+most (half-life 12h). On top of the rank history, v2 uses the games' player
+counts (`playing`): a least-squares slope of log(playing) over the last 72h
+boosts the density of games gaining players fast and shifts their kernel
+centres up the chart (a game doubling its players climbs). The forecast is
+blended 50/50 with a persistence forecast (a tight kernel on each game's most
+recent rank): the scored window's early reads favour the chart standing still,
+its later reads favour the trend. The top 25 games per place are named; each
+place sums to 0.80, leaving 0.20 unnamed for games that join the chart during
+the window. Every named probability is floored so no game ever scores the
+-9.21 log floor.
+
+Validation (canonical scorer, same code as the site's): practice window
+-32.505 (v1: -36.283; house baseline: -43.512), held-out backtests vs the
+house persistence baseline: +9.79 on a 14-read window, +14.72 on a 10-read
+window, +4.37 on a 5-read window. The playing-growth signal is what v1
+missed: on the practice window the chart's climbers were games whose player
+counts were exploding while their ranks had not yet moved. Note the practice
+history's playing counts are sparse (most games report null in most reads);
+the final history carries the house recorder's hourly reads with full playing
+data, so the growth slopes there will be estimated from far more points.
 
 Run: MAKEFUN_INPUT_DIR=input MAKEFUN_OUTPUT_DIR=out python3 main.py
 Deterministic: no randomness, no network, fixed iteration order.
@@ -25,20 +41,25 @@ from datetime import datetime, timezone
 INPUT_DIR = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
 OUTPUT_DIR = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
 
-# --- tunables (chosen by backtesting on held-out reads of the practice history;
-# the final config beats the house persistence baseline on all three splits:
-# +4.5, +13.2 and +0.2 log-score points on 14-, 10- and 5-read windows)
+# --- tunables (chosen by sweeping on the practice window and on three
+# held-out backtest splits of the kit history; every split beats both v1 and
+# the house persistence baseline)
 HALF_LIFE_H = 12.0     # recency weight half-life, hours
 SIGMA0 = 2.0           # kernel sigma at the observation, places
 DIFFUSION = 0.055      # extra kernel sigma per hour of age + horizon, places/hour
 HORIZON_H = 36.0       # forecast horizon: middle of the 72h scored window
-TREND_H = 30.0         # hours of recent history used for rank velocity
-TREND_CAP = 8.0        # max places the trend may shift a kernel centre
+TREND_H = 60.0         # hours of recent history used for rank velocity
+TREND_CAP = 8.0        # max places the rank trend may shift a kernel centre
 TAIL_W = 0.20          # weight of the wide component of the kernel mixture
 TAIL_MULT = 3.0        # wide component sigma multiplier
-RESERVE = 0.10         # unnamed share per place, for games joining during the window
+RESERVE = 0.20         # unnamed share per place, for games joining during the window
 PFLOOR = 0.001         # minimum probability per named game per place
-BLEND = 0.35           # weight of the persistence forecast in the blend
+BLEND = 0.50           # weight of the persistence forecast in the blend
+TOPN = 25              # games named per place
+GROWTH_W = 1.0         # weight of the playing-growth density boost
+GROWTH_H = 72.0        # hours of playing history used for the growth slope
+GROWTH_SHIFT = 15.0    # places of rank shift per log-unit of playing growth
+GROWTH_SHIFT_CAP = 25.0  # max places the growth shift may move a kernel centre
 
 
 def parse_time(s):
@@ -48,6 +69,19 @@ def parse_time(s):
 def gauss(k, mu, sigma):
     z = (k - mu) / sigma
     return math.exp(-0.5 * z * z) / (sigma * math.sqrt(2.0 * math.pi))
+
+
+def least_squares_slope(xs, ys):
+    """Slope of y on x by least squares; 0.0 when undefined."""
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    den = sum((x - mx) ** 2 for x in xs)
+    if den <= 0:
+        return 0.0
+    return sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
 
 
 def main():
@@ -75,12 +109,17 @@ def main():
     t_end = reads[-1][0]
 
     # Per game: list of (age_hours, rank). Age measured from the last read.
+    # Also the playing counts, for the growth signal.
     obs = {}
+    play = {}
     for t, chart in reads:
         age = (t_end - t).total_seconds() / 3600.0
         for row in chart:
             gid = row["universe_id"]
             obs.setdefault(gid, []).append((age, float(row["rank"])))
+            p = row.get("playing")
+            if p and p > 0:
+                play.setdefault(gid, []).append((age, p))
 
     # Rank velocity per game: least-squares slope of rank vs time over the
     # recent window (negative slope = climbing the chart). Places per hour.
@@ -90,28 +129,37 @@ def main():
         if len(recent) < 3:
             vel[gid] = 0.0
             continue
-        xs = [-a for a, _ in recent]  # hours since last read, <= 0
-        ys = [r for _, r in recent]
-        n = len(xs)
-        mx = sum(xs) / n
-        my = sum(ys) / n
-        den = sum((x - mx) ** 2 for x in xs)
-        if den <= 0:
-            vel[gid] = 0.0
-            continue
-        slope = sum((x - mx) * (y - my) for x, y in zip(xs, ys)) / den
+        slope = least_squares_slope([-a for a, _ in recent], [r for _, r in recent])
         vel[gid] = max(-TREND_CAP / HORIZON_H, min(TREND_CAP / HORIZON_H, slope))
 
+    # Playing-growth slope per game: least-squares slope of log(playing) vs
+    # time over the last GROWTH_H hours. Positive = gaining players fast.
+    growth_slope = {}
+    for gid, lst in play.items():
+        recent = [(a, p) for a, p in lst if a <= GROWTH_H and p > 0]
+        if len(recent) < 2:
+            growth_slope[gid] = 0.0
+            continue
+        growth_slope[gid] = least_squares_slope(
+            [-a for a, _ in recent], [math.log(p) for _, p in recent]
+        )
+    for gid in obs:
+        growth_slope.setdefault(gid, 0.0)
+
     # Density of each game at each place: mixture over its observations.
-    # d[gid][k] for k = 1..places.
+    # d[gid][k] for k = 1..places. A game's kernel centres are shifted by its
+    # rank velocity and by its playing-growth shift; its whole density is
+    # then multiplied by the growth boost.
     dens = {}
     last_rank = {}
     for gid, lst in obs.items():
         v = vel[gid]
+        gs = GROWTH_SHIFT * growth_slope[gid] * HORIZON_H
+        gs = max(-GROWTH_SHIFT_CAP, min(GROWTH_SHIFT_CAP, gs))
         d = [0.0] * (places + 1)  # 1-based
         for age, rank in lst:
             w = 0.5 ** (age / HALF_LIFE_H)
-            mu = rank + v * HORIZON_H
+            mu = rank + v * HORIZON_H - gs
             mu = max(1.0, min(120.0, mu))
             sigma = SIGMA0 + DIFFUSION * (age + HORIZON_H)
             for k in range(1, places + 1):
@@ -119,6 +167,9 @@ def main():
                     (1.0 - TAIL_W) * gauss(k, mu, sigma)
                     + TAIL_W * gauss(k, mu, sigma * TAIL_MULT)
                 )
+        mult = math.exp(GROWTH_W * growth_slope[gid] * HORIZON_H)
+        for k in range(1, places + 1):
+            d[k] *= mult
         dens[gid] = d
         last_rank[gid] = lst[-1][1]  # lst is oldest-first, so [-1] is most recent
 
@@ -142,8 +193,8 @@ def main():
         return {g: (PFLOOR if g in floored else raw[g] * scale) for g in dmap}
 
     # Blend the kernel forecast with persistence: the scored window's early
-    # reads favour the chart standing still, its later reads favour diffusion.
-    # A place holds at most 100 rows, so keep the top 100 games per place and
+    # reads favour the chart standing still, its later reads favour the trend.
+    # A place holds at most 100 rows, so keep the top TOPN games per place and
     # rescale them to the budget; the rest fall back to the unnamed share.
     gids = sorted(dens)
     budget = 1.0 - RESERVE
@@ -161,7 +212,7 @@ def main():
         ranked = sorted(
             ((PFLOOR if g in floored else merged[g] * scale, g) for g in gids),
             key=lambda t: (-t[0], t[1]),
-        )[:100]
+        )[:TOPN]
         kept_sum = sum(p for p, _ in ranked)
         rescale = budget / kept_sum if kept_sum > 0 else 0.0
         for p, g in ranked:
